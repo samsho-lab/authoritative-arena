@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Arena client</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; }
+  canvas { background: #1c1f26; margin-top: 12px; border: 1px solid #333; }
+  #hud { margin: 8px; }
+  label { margin-left: 12px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span id="status">connecting...</span>
+  <label><input type="checkbox" id="predict" checked> client-side prediction</label>
+  <label>fake latency <input type="range" id="lag" min="0" max="400" value="0"> <span id="lagv">0</span> ms</label>
+</div>
+<canvas id="c" width="800" height="600"></canvas>
+<script>
+// Must match World.java
+const SPEED = 200, FRAME_DT = 1 / 60, W = 800, H = 600, R = 12, COIN_R = 8;
+
+const url = new URLSearchParams(location.search).get("server") || "ws://localhost:8080";
+const ws = new WebSocket(url);
+const ctx = document.getElementById("c").getContext("2d");
+const statusEl = document.getElementById("status");
+const predictEl = document.getElementById("predict");
+const lagEl = document.getElementById("lag");
+lagEl.oninput = () => document.getElementById("lagv").textContent = lagEl.value;
+
+let myId = null;
+let snapshot = null;
+let me = null;        // predicted local position
+let seq = 0;
+let pending = [];     // inputs sent but not yet confirmed by the server
+const keys = {};
+
+addEventListener("keydown", e => keys[e.key.toLowerCase()] = true);
+addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+
+// Simulated network delay in both directions, to show why prediction matters.
+const delayed = fn => { const ms = +lagEl.value; ms ? setTimeout(fn, ms) : fn(); };
+
+ws.onopen = () => statusEl.textContent = "connected to " + url;
+ws.onclose = () => statusEl.textContent = "disconnected";
+ws.onmessage = ev => delayed(() => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === "welcome") { myId = msg.id; return; }
+  if (msg.type !== "snapshot") return;
+  snapshot = msg;
+
+  const server = msg.players.find(p => p.id === myId);
+  if (!server) return;
+
+  // Reconciliation: start from where the server says we are, throw away the
+  // inputs it has already applied, and replay the rest on top.
+  me = { x: server.x, y: server.y };
+  pending = pending.filter(i => i.seq > server.lastSeq);
+  if (predictEl.checked) pending.forEach(i => move(me, i.dx, i.dy));
+});
+
+function move(p, dx, dy) {
+  const len = Math.hypot(dx, dy);
+  if (len > 1) { dx /= len; dy /= len; }
+  p.x = Math.max(R, Math.min(W - R, p.x + dx * SPEED * FRAME_DT));
+  p.y = Math.max(R, Math.min(H - R, p.y + dy * SPEED * FRAME_DT));
+}
+
+function frame() {
+  if (myId !== null && me && ws.readyState === WebSocket.OPEN) {
+    const dx = (keys["d"] || keys["arrowright"] ? 1 : 0) - (keys["a"] || keys["arrowleft"] ? 1 : 0);
+    const dy = (keys["s"] || keys["arrowdown"] ? 1 : 0) - (keys["w"] || keys["arrowup"] ? 1 : 0);
+    if (dx || dy) {
+      const input = { type: "input", seq: ++seq, dx, dy };
+      pending.push(input);
+      if (predictEl.checked) move(me, dx, dy);
+      const payload = JSON.stringify(input);
+      delayed(() => ws.readyState === WebSocket.OPEN && ws.send(payload));
+    }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  if (!snapshot) return;
+  ctx.fillStyle = "#f5c542";
+  for (const c of snapshot.coins) { ctx.beginPath(); ctx.arc(c.x, c.y, COIN_R, 0, 7); ctx.fill(); }
+  for (const p of snapshot.players) {
+    const pos = p.id === myId && predictEl.checked && me ? me : p;
+    ctx.fillStyle = p.id === myId ? "#4fc3f7" : "#e57373";
+    ctx.beginPath(); ctx.arc(pos.x, pos.y, R, 0, 7); ctx.fill();
+    ctx.fillStyle = "#ddd";
+    ctx.fillText(`#${p.id}  ${p.score}`, pos.x - 14, pos.y - 18);
+  }
+  ctx.fillText(`tick ${snapshot.tick}   unconfirmed inputs ${pending.length}`, 10, 18);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
